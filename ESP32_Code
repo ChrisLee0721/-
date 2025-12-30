@@ -1,0 +1,796 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+#include <Ultrasonic.h>
+
+// LCD configuration
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Servo definitions
+Servo servoX, servoY;
+int servoXPin = 14, servoYPin = 12;
+
+// Pin definitions
+#define SHCP 32
+#define DS   33
+#define STCP 25
+#define D1 17
+#define D2 18
+#define D3 19
+#define D4 5
+#define D5 4
+#define TRIG_PIN 23
+#define ECHO_PIN 34
+#define BUZZER_PIN 15
+#define MODE_BUTTON_PIN 21
+#define LED_R 22
+#define LED_G 2
+
+// Ultrasonic object
+Ultrasonic ultrasonic(TRIG_PIN, ECHO_PIN);
+
+// 7-segment patterns
+byte digitPattern[10] = {0xC0,0xF9,0xA4,0xB0,0x99,0x92,0x82,0xF8,0x80,0x90};
+byte letterPattern[26] = {0x88,0x83,0xC6,0xA1,0x86,0x8E,0x90,0x89,0xCF,0xE1,
+                          0x89,0xC7,0xAA,0xAB,0xA3,0x8C,0x98,0xAF,0x92,0x87,
+                          0xC1,0xE3,0xD5,0x89,0x91,0xA4};
+
+// Serial communication
+uint8_t rxBuffer[6];
+int bufferIndex = 0;
+
+// Servo angles
+int lastAngleX = 90, lastAngleY = 90;
+int displayedAngleX = 90, displayedAngleY = 90;
+int deadZone = 3;
+
+// Mode definitions
+#define MODE_PROPORTIONAL 0
+#define MODE_THRESHOLD    1
+int currentMode = MODE_PROPORTIONAL;
+
+// Menu system
+bool inMenu = false;
+int menuSelection = 0;
+int totalMenuItems = 11;
+const char* menuItems[] = {"Control Mode","Dead Zone","Slow Speed","Tube Display",
+                          "Single Tube","Menu Sound","Range Sound","HC-SR04 Switch",
+                          "LCD Display Mode","Edit Message","Exit Menu"};
+
+// Display modes
+#define TUBE_MODE_XY_AUTO 0
+#define TUBE_MODE_X_ONLY  1
+#define TUBE_MODE_Y_ONLY  2
+#define TUBE_MODE_BOTH    3
+int tubeDisplayMode = TUBE_MODE_XY_AUTO;
+int displayedTubeMode = -1;
+
+#define SINGLE_MODE_NONE   0
+#define SINGLE_MODE_X      1
+#define SINGLE_MODE_Y      2
+#define SINGLE_MODE_PAGE   3
+int singleTubeMode = SINGLE_MODE_X;
+int displayedSingleMode = -1;
+
+#define LCD_MODE_XY_ANGLE    0
+#define LCD_MODE_DISTANCE    1
+#define LCD_MODE_WELCOME     2
+#define LCD_MODE_CUSTOM_MSG  3
+int lcdDisplayMode = LCD_MODE_XY_ANGLE;
+int displayedLcdMode = -1;
+
+// Custom message
+#define MAX_CUSTOM_MSG_LEN 32
+char customMessage[MAX_CUSTOM_MSG_LEN] = "LUNA Control System";
+int customMsgLength = 20;
+bool editingCustomMsg = false;
+int editCursorPos = 0, currentCharIndex = 0;
+const char charSet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,!?-";
+
+// Buzzer settings
+bool menuSoundEnabled = true, rangeSoundEnabled = false, hcSr04Enabled = false;
+
+// Slow mode movement tracking
+unsigned long totalSlowMoves = 0, lastSecondStart = 0;
+int movesInCurrentSecond = 0;
+
+// Configuration options
+int deadZoneOptions[] = {1, 3, 5, 10};
+int currentDeadZoneIndex = 1;
+int speedOptions[] = {1, 2, 3, 5};
+int currentSpeedIndex = 1;
+int slowMoveSpeed = speedOptions[currentSpeedIndex];
+
+// Threshold mode
+#define THRESHOLD 100
+
+// Joystick menu control
+int lastRawX = 512, lastRawY = 512;
+
+// Digit tube variables
+int currentDigitDisplay[5] = {-1,-1,-1,-1,-1};
+int targetDigitDisplay[5] = {8,8,8,8,8};
+bool tubeNeedsRefresh = true;
+unsigned long lastTubeRefresh = 0;
+int currentScanDigit = 0;
+unsigned long lastScanTime = 0;
+bool showXAngle = true;
+unsigned long lastAutoSwitch = 0;
+
+// HC-SR04 variables
+long distance = -1;
+unsigned long lastHcSr04Read = 0;
+
+// Buzzer control
+unsigned long lastBuzzerTime = 0;
+int buzzerInterval = 1000;
+
+// Serial display
+unsigned long lastSerialUpdate = 0;
+bool serialNeedsUpdate = true;
+
+// Slow mode timer
+unsigned long lastSlowModeMove = 0;
+
+// LCD display state
+bool welcomeShown = false;
+
+// Digit tube PIN array for optimized control
+const int digitPins[] = {D1, D2, D3, D4, D5};
+
+template<typename T,typename U>T custom_min(T a,U b){return(a<b)?a:b;}
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, 16, 17);
+  Wire.begin(26, 27);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  initDigitalTube();
+  initBuzzer();
+  servoX.attach(servoXPin);
+  servoY.attach(servoYPin);
+  servoX.write(90);
+  servoY.write(90);
+  delay(1000);
+  pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  digitalWrite(LED_R, LOW);
+  digitalWrite(LED_G, HIGH);
+  lcd.setCursor(0, 0);
+  lcd.print("LUNA Control Sys");
+  lcd.setCursor(0, 1);
+  lcd.print("Version 2.0");
+  tubeNeedsRefresh = true;
+  delay(2000);
+  initMainDisplay();
+  Serial.println("System Started");
+  Serial.println("Slow Mode: Move set degrees per second");
+  serialNeedsUpdate = true;
+  lastSecondStart = millis();
+}
+
+void initBuzzer() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void menuBeep(int duration) {
+  if(menuSoundEnabled) beep(duration);
+}
+
+void beep(int duration) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(duration);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void initDigitalTube() {
+  int controlPins[] = {SHCP, DS, STCP};
+  for(int i = 0; i < 3; i++) pinMode(controlPins[i], OUTPUT);
+  for(int i = 0; i < 5; i++) {pinMode(digitPins[i], OUTPUT); digitalWrite(digitPins[i], HIGH);}
+  digitalWrite(SHCP, LOW); digitalWrite(DS, LOW); digitalWrite(STCP, LOW);
+}
+
+void refreshDigitalTube() {
+  unsigned long t = millis();
+  if(tubeNeedsRefresh && (t - lastTubeRefresh >= 50)) {
+    updateTubeContent();
+    tubeNeedsRefresh = false;
+    lastTubeRefresh = t;
+  }
+  if(t - lastScanTime >= 3) {
+    performDigitScan();
+    lastScanTime = t;
+  }
+}
+
+void updateTubeContent() {
+  bool changed = false;
+  for(int i = 0; i < 5; i++) {
+    if(targetDigitDisplay[i] != currentDigitDisplay[i]) {
+      currentDigitDisplay[i] = targetDigitDisplay[i];
+      changed = true;
+    }
+  }
+}
+
+void performDigitScan() {
+  digitalWrite(digitPins[currentScanDigit], HIGH);
+  currentScanDigit = (currentScanDigit + 1) % 5;
+  byte pattern = 0xFF;
+  int digitValue = currentDigitDisplay[currentScanDigit];
+  if(digitValue >= 0 && digitValue <= 9) pattern = digitPattern[digitValue];
+  else if(digitValue >= 10 && digitValue <= 35) pattern = letterPattern[digitValue - 10];
+  shiftOutData(pattern);
+  digitalWrite(digitPins[currentScanDigit], LOW);
+}
+
+void shiftOutData(byte data) {
+  digitalWrite(STCP, LOW);
+  shiftOut(DS, SHCP, MSBFIRST, data);
+  digitalWrite(STCP, HIGH);
+}
+
+int readDistance() {
+  if(!hcSr04Enabled) return -1;
+  distance = ultrasonic.read();
+  return distance;
+}
+
+void controlBuzzer() {
+  unsigned long t = millis();
+  if(rangeSoundEnabled && hcSr04Enabled && distance > 0 && distance <= 200) {
+    buzzerInterval = map(distance, 5, 200, 100, 1000);
+    buzzerInterval = constrain(buzzerInterval, 100, 1000);
+    if(t - lastBuzzerTime > buzzerInterval) {
+      beep(50);
+      lastBuzzerTime = t;
+    }
+  }
+}
+
+void updateTubeDisplay() {
+  if(inMenu) updateMenuTubeDisplay();
+  else updateNormalTubeDisplay();
+}
+
+void updateNormalTubeDisplay() {
+  unsigned long t = millis();
+  if(tubeDisplayMode == TUBE_MODE_XY_AUTO) {
+    if(t - lastAutoSwitch > 2000) {
+      showXAngle = !showXAngle;
+      lastAutoSwitch = t;
+      tubeNeedsRefresh = true;
+    }
+  }
+  if(lastAngleX != displayedAngleX || lastAngleY != displayedAngleY) {
+    tubeNeedsRefresh = true;
+    displayedAngleX = lastAngleX;
+    displayedAngleY = lastAngleY;
+  }
+  if(tubeDisplayMode != displayedTubeMode || singleTubeMode != displayedSingleMode) {
+    tubeNeedsRefresh = true;
+    displayedTubeMode = tubeDisplayMode;
+    displayedSingleMode = singleTubeMode;
+  }
+  if(tubeNeedsRefresh) updateTubeContentBasedOnMode();
+}
+
+void updateTubeContentBasedOnMode() {
+  switch(tubeDisplayMode) {
+    case TUBE_MODE_XY_AUTO: if(showXAngle) setTubeXAngle(); else setTubeYAngle(); break;
+    case TUBE_MODE_X_ONLY: setTubeXAngle(); break;
+    case TUBE_MODE_Y_ONLY: setTubeYAngle(); break;
+    case TUBE_MODE_BOTH: setTubeBothAngles(); break;
+  }
+  switch(singleTubeMode) {
+    case SINGLE_MODE_NONE: targetDigitDisplay[4] = -1; break;
+    case SINGLE_MODE_X: targetDigitDisplay[4] = 23; break;
+    case SINGLE_MODE_Y: targetDigitDisplay[4] = 24; break;
+    case SINGLE_MODE_PAGE: targetDigitDisplay[4] = -1; break;
+  }
+}
+
+void setTubeXAngle() {
+  targetDigitDisplay[0] = 23;
+  formatAngleToDigits(lastAngleX, 1);
+}
+
+void setTubeYAngle() {
+  targetDigitDisplay[0] = 24;
+  formatAngleToDigits(lastAngleY, 1);
+}
+
+void setTubeBothAngles() {
+  static unsigned long fastSwitchTime = 0;
+  static bool showX = true;
+  unsigned long t = millis();
+  if(t - fastSwitchTime > 500) {
+    showX = !showX;
+    fastSwitchTime = t;
+    tubeNeedsRefresh = true;
+  }
+  if(showX) setTubeXAngle();
+  else setTubeYAngle();
+}
+
+void formatAngleToDigits(int angle, int startIndex) {
+  angle = constrain(angle, 0, 180);
+  targetDigitDisplay[startIndex] = angle / 100;
+  targetDigitDisplay[startIndex + 1] = (angle / 10) % 10;
+  targetDigitDisplay[startIndex + 2] = angle % 10;
+}
+
+void updateMenuTubeDisplay() {
+  static int lastMenuSelection = -1;
+  if(menuSelection != lastMenuSelection) {
+    tubeNeedsRefresh = true;
+    lastMenuSelection = menuSelection;
+  }
+  if(tubeNeedsRefresh) {
+    targetDigitDisplay[0] = 15;
+    targetDigitDisplay[1] = 10;
+    targetDigitDisplay[2] = 18;
+    targetDigitDisplay[3] = 18;
+    if(singleTubeMode == SINGLE_MODE_PAGE) targetDigitDisplay[4] = menuSelection + 1;
+    else targetDigitDisplay[4] = -1;
+  }
+}
+
+void drawLcdLines(const String& l1,
+                  const String& l2,
+                  unsigned long minIntervalMs,
+                  unsigned long& lastDrawMs,
+                  String& prevL1,
+                  String& prevL2,
+                  bool force = false) {
+  unsigned long t = millis();
+  bool changed = force || (l1 != prevL1) || (l2 != prevL2);
+  if (!changed && (t - lastDrawMs < minIntervalMs)) return;
+
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(l1);
+  lcd.setCursor(0, 1); lcd.print(l2);
+
+  prevL1 = l1;
+  prevL2 = l2;
+  lastDrawMs = t;
+}
+
+void updateLcdDisplay() {
+  if(lcdDisplayMode != displayedLcdMode) {
+    lcd.clear();
+    displayedLcdMode = lcdDisplayMode;
+    welcomeShown = false;
+  }
+  switch(lcdDisplayMode) {
+    case LCD_MODE_XY_ANGLE: showXYAngleOnLcd(); break;
+    case LCD_MODE_DISTANCE: showDistanceOnLcd(); break;
+    case LCD_MODE_WELCOME: showWelcomeOnLcd(); break;
+    case LCD_MODE_CUSTOM_MSG: showCustomMessageOnLcd(); break;
+  }
+}
+
+void showXYAngleOnLcd() {
+  static unsigned long lastDraw = 0;
+  static String prevL1 = "", prevL2 = "";
+  String l1 = "X:" + String(lastAngleX) + " Y:" + String(lastAngleY);
+  String l2 = (currentMode == MODE_PROPORTIONAL ? "N" : "S");
+  l2 += " S:" + String(slowMoveSpeed);
+  l2 += " D:" + String(deadZone);
+  l2 += hcSr04Enabled ? " U" : "  ";
+  drawLcdLines(l1, l2, 200, lastDraw, prevL1, prevL2);
+}
+
+void showDistanceOnLcd() {
+  static unsigned long lastDraw = 0;
+  static String prevL1 = "", prevL2 = "";
+  String l1 = "Distance:";
+  String l2;
+  if (hcSr04Enabled) {
+    l2 = (distance > 0) ? String(distance) + " cm" : "No Signal";
+  } else {
+    l2 = "Disabled";
+  }
+  drawLcdLines(l1, l2, 1000, lastDraw, prevL1, prevL2);
+}
+
+void showWelcomeOnLcd() {
+  static unsigned long lastDraw = 0;
+  static String prevL1 = "", prevL2 = "";
+  drawLcdLines("LUNA Control Sys", "Version 2.0", 0, lastDraw, prevL1, prevL2);
+}
+
+void showCustomMessageOnLcd() {
+  static unsigned long lastDraw = 0;
+  static String prevL1 = "", prevL2 = "";
+  String full = String(customMessage);
+  String l1 = full.substring(0, custom_min(16, full.length()));
+  String l2 = "";
+  if (full.length() > 16) {
+    l2 = full.substring(16, custom_min(32, full.length()));
+  }
+  drawLcdLines(l1, l2, 500, lastDraw, prevL1, prevL2);
+}
+
+void updateSerialDisplay() {
+  unsigned long t = millis();
+  if(serialNeedsUpdate || (t - lastSerialUpdate >= 500)) {
+    // 格式化主要状态信息
+    Serial.printf("X:%d Y:%d M:%c DZ:%d SP:%d Menu:%c MS:%d RS:%d US:%d ",
+                  lastAngleX, lastAngleY, 
+                  currentMode == MODE_PROPORTIONAL ? 'N' : 'S',
+                  deadZone, slowMoveSpeed,
+                  inMenu ? 'Y' : 'N',
+                  menuSoundEnabled, rangeSoundEnabled, hcSr04Enabled);
+    
+    // 显示模式
+    const char* tdMode[] = {"A", "X", "Y", "B"};
+    const char* stMode[] = {"N", "X", "Y", "P"};
+    const char* ldMode[] = {"XY", "DS", "WL", "CM"};
+    Serial.printf("TD:%s ST:%s LD:%s Dist:", 
+                  tdMode[tubeDisplayMode], stMode[singleTubeMode], ldMode[lcdDisplayMode]);
+    
+    // 距离信息
+    if(hcSr04Enabled && distance > 0) Serial.printf("%ldcm", distance);
+    else Serial.print(hcSr04Enabled ? "NaN" : "OFF");
+    
+    Serial.printf(" SlowMoves:%lu\n", totalSlowMoves);
+    
+    lastSerialUpdate = t;
+    serialNeedsUpdate = false;
+  }
+}
+
+void loop() {
+  checkModeButton();
+  while(Serial2.available()) {
+    uint8_t data = Serial2.read();
+    if(bufferIndex == 0 && data != 0xAA) continue;
+    rxBuffer[bufferIndex++] = data;
+    if(bufferIndex >= 6) {
+      processFrame();
+      bufferIndex = 0;
+    }
+  }
+  unsigned long t = millis();
+  if(t - lastSecondStart >= 1000) {
+    if(movesInCurrentSecond > 0 && currentMode == MODE_THRESHOLD) {
+      Serial.print("Slow Mode Stats: ");
+      Serial.print(movesInCurrentSecond);
+      Serial.print(" moves in last second (Set: ");
+      Serial.print(slowMoveSpeed);
+      Serial.println(" deg/sec)");
+    }
+    movesInCurrentSecond = 0;
+    lastSecondStart = t;
+  }
+  if(hcSr04Enabled && t - lastHcSr04Read > 100) {
+    int newDistance = readDistance();
+    if(newDistance != distance) {
+      distance = newDistance;
+      serialNeedsUpdate = true;
+    }
+    lastHcSr04Read = t;
+  }
+  controlBuzzer();
+  refreshDigitalTube();
+  updateTubeDisplay();
+  if(editingCustomMsg) {
+    // In custom message edit mode, LCD is handled separately
+  } else if(inMenu) updateMenuDisplay();
+  else updateLcdDisplay();
+  updateSerialDisplay();
+  delay(1);
+}
+
+void processFrame() {
+  uint16_t rawX = (rxBuffer[1] << 8) | rxBuffer[2];
+  uint16_t rawY = (rxBuffer[3] << 8) | rxBuffer[4];
+  if(inMenu) {
+    if(editingCustomMsg) handleCustomMessageEdit(rawX, rawY);
+    else handleMenuNavigation(rawX, rawY);
+    return;
+  }
+  if(currentMode == MODE_PROPORTIONAL) {
+    int angleX = map(rawX, 0, 1023, 0, 180);
+    int angleY = map(rawY, 0, 1023, 0, 180);
+    angleX = constrain(angleX, 0, 180);
+    angleY = constrain(angleY, 0, 180);
+    if(abs(angleX - lastAngleX) > deadZone || abs(angleY - lastAngleY) > deadZone) {
+      servoX.write(angleX);
+      servoY.write(angleY);
+      lastAngleX = angleX;
+      lastAngleY = angleY;
+      tubeNeedsRefresh = true;
+      serialNeedsUpdate = true;
+    }
+  } else controlServoThresholdMode(rawX, rawY);
+}
+
+void controlServoThresholdMode(uint16_t rawX, uint16_t rawY) {
+  unsigned long t = millis();
+  int moveInterval = 1000 / slowMoveSpeed;
+  if(moveInterval < 20) moveInterval = 20;
+  if(t - lastSlowModeMove < moveInterval) return;
+  bool moved = false;
+  if(rawX < 512 - THRESHOLD) {
+    if(lastAngleX > 0) {lastAngleX--; servoX.write(lastAngleX); moved = true;}
+  } else if(rawX > 512 + THRESHOLD) {
+    if(lastAngleX < 180) {lastAngleX++; servoX.write(lastAngleX); moved = true;}
+  }
+  if(rawY < 512 - THRESHOLD) {
+    if(lastAngleY > 0) {lastAngleY--; servoY.write(lastAngleY); moved = true;}
+  } else if(rawY > 512 + THRESHOLD) {
+    if(lastAngleY < 180) {lastAngleY++; servoY.write(lastAngleY); moved = true;}
+  }
+  if(moved) {
+    lastSlowModeMove = t;
+    totalSlowMoves++;
+    movesInCurrentSecond++;
+    tubeNeedsRefresh = true;
+    serialNeedsUpdate = true;
+  }
+}
+
+void initMainDisplay() {
+  static unsigned long lastDraw = 0;
+  static String prevL1 = "", prevL2 = "";
+  drawLcdLines("X:     Y:    ", "Mode: Sp: Dead:", 0, lastDraw, prevL1, prevL2, true);
+  displayedAngleX = displayedAngleY = -1;
+}
+
+void updateMenuDisplay() {
+  static unsigned long lastDraw = 0;
+  static String prevL1 = "", prevL2 = "";
+  static int lastMenuSelection = -1;
+  String displayValue = "";
+  
+  // 第一行：菜单标题
+  String menuTitle = menuItems[menuSelection];
+  
+  // 第二行：菜单值
+  switch(menuSelection) {
+    case 0: displayValue = (currentMode == MODE_PROPORTIONAL)?"Normal Mode":"Slow Mode"; break;
+    case 1: displayValue = String(deadZone)+" degrees"; break;
+    case 2: displayValue = String(slowMoveSpeed)+" deg/sec"; break;
+    case 3: {const char* modes[]{"Auto Switch","X Only","Y Only","Both"}; displayValue = modes[tubeDisplayMode];} break;
+    case 4: {const char* modes[]{"Disabled","Show X","Show Y","Menu Page"}; displayValue = modes[singleTubeMode];} break;
+    case 5: displayValue = menuSoundEnabled?"Enabled":"Disabled"; break;
+    case 6: displayValue = rangeSoundEnabled?"Enabled":"Disabled"; break;
+    case 7: displayValue = hcSr04Enabled?"Enabled":"Disabled"; break;
+    case 8: {const char* modes[]{"XY Angle","Distance","Welcome Msg","Custom Msg"}; displayValue = modes[lcdDisplayMode];} break;
+    case 9: displayValue = "Press to edit"; break;
+    case 10: displayValue = "Press to exit"; break;
+  }
+  
+  String l2 = "< " + displayValue + " >";
+  bool forceRedraw = (menuSelection != lastMenuSelection);
+  if(forceRedraw) lastMenuSelection = menuSelection;
+  
+  drawLcdLines(menuTitle, l2, 1000, lastDraw, prevL1, prevL2, forceRedraw);
+}
+
+void checkModeButton() {
+  static bool lastButtonState = HIGH, buttonPressed = false;
+  static unsigned long lastPressTime = 0;
+  bool currentState = digitalRead(MODE_BUTTON_PIN);
+  if(lastButtonState == HIGH && currentState == LOW) {
+    if(millis() - lastPressTime > 50) {
+      buttonPressed = true;
+      lastPressTime = millis();
+    }
+  }
+  if(lastButtonState == LOW && currentState == HIGH && buttonPressed) {
+    if(millis() - lastPressTime > 300) {
+      if(!inMenu) enterMenu();
+      else {
+        if(menuSelection == 9) enterCustomMessageEdit();
+        else if(menuSelection == 10) exitMenu();
+      }
+      buttonPressed = false;
+    }
+  }
+  lastButtonState = currentState;
+}
+
+void enterMenu() {
+  inMenu = true;
+  menuSelection = 0;
+  digitalWrite(LED_R, HIGH);
+  digitalWrite(LED_G, LOW);
+  tubeNeedsRefresh = true;
+  serialNeedsUpdate = true;
+  // LCD will be updated in updateMenuDisplay() on next loop
+  menuBeep(100);
+}
+
+void exitMenu() {
+  inMenu = false;
+  digitalWrite(LED_R, LOW);
+  digitalWrite(LED_G, HIGH);
+  tubeNeedsRefresh = true;
+  serialNeedsUpdate = true;
+  // LCD will be updated by updateLcdDisplay() on next loop
+  displayedLcdMode = -1;  // Force refresh
+  menuBeep(100);
+}
+
+void handleMenuNavigation(uint16_t rawX, uint16_t rawY) {
+  if(!inMenu) return;
+  bool changed = false;
+  if(abs(rawY - lastRawY) > 100) {
+    if(rawY < 400 && lastRawY >= 400) {
+      menuSelection = (menuSelection - 1 + totalMenuItems) % totalMenuItems;
+      changed = true;
+      menuBeep(60);
+    } else if(rawY > 600 && lastRawY <= 600) {
+      menuSelection = (menuSelection + 1) % totalMenuItems;
+      changed = true;
+      menuBeep(60);
+    }
+  }
+  if(abs(rawX - lastRawX) > 100) {
+    if(rawX < 400 && lastRawX >= 400) {
+      handleMenuAdjust(-1);  // 左移：递减
+      changed = true;
+      menuBeep(60);
+    } else if(rawX > 600 && lastRawX <= 600) {
+      handleMenuAdjust(1);   // 右移：递增
+      changed = true;
+      menuBeep(60);
+    }
+  }
+  if(changed) {
+    tubeNeedsRefresh = true;
+    serialNeedsUpdate = true;
+  }
+  lastRawX = rawX;
+  lastRawY = rawY;
+}
+
+void handleMenuAdjust(int direction) {
+  switch(menuSelection) {
+    // 数值调整类菜单项
+    case 0:  // 控制模式 (Normal/Slow)
+      currentMode = (currentMode + direction + 2) % 2;
+      break;
+      
+    case 1:  // 死区 (1/3/5/10)
+      currentDeadZoneIndex = (currentDeadZoneIndex + direction + 4) % 4;
+      deadZone = deadZoneOptions[currentDeadZoneIndex];
+      break;
+      
+    case 2:  // 慢速移动速度 (1/2/3/5 deg/sec)
+      currentSpeedIndex = (currentSpeedIndex + direction + 4) % 4;
+      slowMoveSpeed = speedOptions[currentSpeedIndex];
+      break;
+      
+    case 3:  // 数码管显示模式
+      tubeDisplayMode = (tubeDisplayMode + direction + 4) % 4;
+      break;
+      
+    case 4:  // 单管显示模式
+      singleTubeMode = (singleTubeMode + direction + 4) % 4;
+      break;
+      
+    // 开关切换类菜单项 (toggle函数内部已设置serialNeedsUpdate)
+    case 5: toggleMenuSound(); return;
+    case 6: toggleRangeSound(); return;
+    case 7: toggleHcSr04(); return;
+      
+    case 8:  // LCD显示模式
+      lcdDisplayMode = (lcdDisplayMode + direction + 4) % 4;
+      displayedLcdMode = -1;  // 强制刷新LCD
+      break;
+  }
+  
+  serialNeedsUpdate = true;  // 数值类菜单项统一设置更新标志
+}
+
+void toggleMenuSound() { menuSoundEnabled = !menuSoundEnabled; updateSerialNeeded(); }
+void toggleRangeSound() { rangeSoundEnabled = !rangeSoundEnabled; if(rangeSoundEnabled && !hcSr04Enabled) hcSr04Enabled = true; updateSerialNeeded(); }
+void toggleHcSr04() { hcSr04Enabled = !hcSr04Enabled; if(!hcSr04Enabled && rangeSoundEnabled) rangeSoundEnabled = false; updateSerialNeeded(); }
+void updateSerialNeeded() { serialNeedsUpdate = true; }
+
+void enterCustomMessageEdit() {
+  editingCustomMsg = true;
+  editCursorPos = 0;
+  currentCharIndex = 0;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Edit Message:");
+  lcd.setCursor(0, 1);
+  lcd.print("A");
+  lcd.print(char(126));
+  lcd.setCursor(3, 1);
+  for(int i = 0; i < 13; i++) lcd.print(charSet[i]);
+  menuBeep(100);
+}
+
+void handleCustomMessageEdit(uint16_t rawX, uint16_t rawY) {
+  static unsigned long lastEditTime = 0;
+  if(!editingCustomMsg) return;
+  unsigned long t = millis();
+  if(t - lastEditTime < 200) return;
+  bool changed = false;
+  if(rawX < 400) {
+    currentCharIndex = (currentCharIndex - 1 + sizeof(charSet) - 1) % (sizeof(charSet) - 1);
+    changed = true;
+  } else if(rawX > 600) {
+    currentCharIndex = (currentCharIndex + 1) % (sizeof(charSet) - 1);
+    changed = true;
+  }
+  if(rawY < 400 && editCursorPos > 0) {
+    editCursorPos--;
+    changed = true;
+  } else if(rawY > 600 && editCursorPos < MAX_CUSTOM_MSG_LEN - 1) {
+    editCursorPos++;
+    changed = true;
+  }
+  if(changed) {
+    updateEditDisplay();
+    lastEditTime = t;
+    menuBeep(60);
+  }
+  static bool lastButtonCheck = false;
+  bool buttonPressed = (digitalRead(MODE_BUTTON_PIN) == LOW);
+  if(buttonPressed && !lastButtonCheck) {
+    if(editCursorPos < MAX_CUSTOM_MSG_LEN - 1) {
+      customMessage[editCursorPos] = charSet[currentCharIndex];
+      if(editCursorPos >= customMsgLength) {
+        customMsgLength = editCursorPos + 1;
+        customMessage[customMsgLength] = '\0';
+      }
+      editCursorPos++;
+      updateEditDisplay();
+      menuBeep(80);
+    }
+  }
+  lastButtonCheck = buttonPressed;
+  static unsigned long buttonPressTime = 0;
+  if(buttonPressed) {
+    if(buttonPressTime == 0) buttonPressTime = t;
+    else if(t - buttonPressTime > 1000) {
+      exitCustomMessageEdit();
+      buttonPressTime = 0;
+    }
+  } else buttonPressTime = 0;
+}
+
+void updateEditDisplay() {
+  lcd.setCursor(0, 1);
+  lcd.print("                ")
+  lcd.setCursor(0, 1);
+  for(int i = 0; i < editCursorPos && i < 16; i++) {
+    if(i < customMsgLength) lcd.print(customMessage[i]);
+    else lcd.print("_");
+  }
+  lcd.print(charSet[currentCharIndex]);
+  lcd.print(char(126));
+  lcd.setCursor(editCursorPos + 2, 1);
+  int startIdx = currentCharIndex - 6;
+  if(startIdx < 0) startIdx = 0;
+  if(startIdx > sizeof(charSet) - 14) startIdx = sizeof(charSet) - 14;
+  for(int i = 0; i < 13 && startIdx + i < sizeof(charSet) - 1; i++) lcd.print(charSet[startIdx + i]);
+}
+
+void exitCustomMessageEdit() {
+  editingCustomMsg = false;
+  saveCustomMessage();
+  static unsigned long lastDraw = 0;
+  static String prevL1 = "", prevL2 = "";
+  drawLcdLines("Message Saved!", "Returning to menu", 0, lastDraw, prevL1, prevL2, true);
+  delay(1500);
+  menuBeep(100);
+  // Force menu display update on next loop
+}
+
+void saveCustomMessage() {
+  customMessage[customMsgLength] = '\0';
+  Serial.print("Custom message saved: ");
+  Serial.println(customMessage);
+}
