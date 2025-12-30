@@ -1,0 +1,68 @@
+#define JOY_X A2
+#define JOY_Y A1
+#define PIN_SW A0
+#define FILTER_SIZE 3
+// 陣列大小
+
+int xBuffer[FILTER_SIZE], yBuffer[FILTER_SIZE];
+int filterIndex = 0;
+float smoothX = 512.0, smoothY = 512.0;
+
+// 發送控制
+unsigned long lastSendTime = 0;
+const unsigned long SEND_INTERVAL = 20;
+unsigned long lastStatsTime = 0;
+int sendCount = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_SW, INPUT_PULLUP);
+  pinMode(13, OUTPUT);
+  
+// 初始化濾波緩衝
+  for(int i = 0; i < FILTER_SIZE; i++) {
+    xBuffer[i] = analogRead(JOY_X);
+    yBuffer[i] = analogRead(JOY_Y);
+  }
+  digitalWrite(13, HIGH);
+  delay(500);
+  digitalWrite(13, LOW);
+}
+
+// 平均濾波
+int getFilteredX() {
+  xBuffer[filterIndex] = analogRead(JOY_X);
+  int sum = 0;
+  for(int i = 0; i < FILTER_SIZE; i++) sum += xBuffer[i];
+  return sum / FILTER_SIZE;
+}
+int getFilteredY() {
+  yBuffer[filterIndex] = analogRead(JOY_Y);
+  int sum = 0;
+  for(int i = 0; i < FILTER_SIZE; i++) sum += yBuffer[i];
+  return sum / FILTER_SIZE;
+}
+void loop() {
+  unsigned long now = millis();
+  filterIndex = (filterIndex + 1) % FILTER_SIZE;
+  int rawX = getFilteredX();
+  int rawY = getFilteredY();
+  int btn = digitalRead(PIN_SW);
+  smoothX = smoothX * 0.7 + rawX * 0.3;
+  smoothY = smoothY * 0.7 + rawY * 0.3;
+  int x = (int)smoothX;
+  int y = (int)smoothY;
+  if(now - lastSendTime >= SEND_INTERVAL) {
+    if(Serial.availableForWrite() >= 6) {
+      Serial.write(0xAA);
+      Serial.write(x >> 8);
+      Serial.write(x & 0xFF);
+      Serial.write(y >> 8);
+      Serial.write(y & 0xFF);
+      Serial.write(btn);
+      sendCount++;
+      lastSendTime = now;
+      digitalWrite(13, !digitalRead(13));
+    }
+  }
+}
